@@ -1,4 +1,5 @@
 use crate::config::InstanceConfig;
+use crate::failure::{Kind, fail};
 use anyhow::{Context, Result, bail};
 use reqwest::{Client, Method};
 use serde::{Deserialize, Serialize};
@@ -44,9 +45,12 @@ impl DokployClient {
     pub async fn post_procedure(&self, procedure: &str, body: Value) -> Result<Value> {
         validate_procedure(procedure)?;
         if is_destructive(procedure) {
-            bail!(
-                "refusing destructive procedure {procedure}: deletes are run by a person from the Dokploy panel"
-            );
+            return Err(fail(
+                Kind::Refused,
+                format!(
+                    "refusing destructive procedure {procedure}: deletes are run by a person from the Dokploy panel"
+                ),
+            ));
         }
         self.request(Method::POST, procedure, &[], Some(body)).await
     }
@@ -95,7 +99,13 @@ impl DokployClient {
             .context("cannot read Dokploy response")?;
         if !status.is_success() {
             // The body is withheld: a proxy or server could echo request data back.
-            bail!("{procedure}: {}", status_hint(status.as_u16()));
+            let status = status.as_u16();
+            let kind = if matches!(status, 401 | 403) {
+                Kind::Auth
+            } else {
+                Kind::Api
+            };
+            return Err(fail(kind, format!("{procedure}: {}", status_hint(status))));
         }
         if bytes.is_empty() {
             return Ok(Value::Null);
@@ -131,15 +141,21 @@ fn status_hint(status: u16) -> String {
 fn connection_error(base_url: &Url, error: reqwest::Error) -> anyhow::Error {
     let host = base_url.host_str().unwrap_or("?");
     if error.is_timeout() {
-        anyhow::anyhow!(
-            "{host} did not answer in time. Run `doctor`: on a private panel this is usually the VPN"
+        fail(
+            Kind::Network,
+            format!(
+                "{host} did not answer in time. Run `doctor`: on a private panel this is usually the VPN"
+            ),
         )
     } else if error.is_connect() {
-        anyhow::anyhow!(
-            "cannot connect to {host}. Run `doctor`: if the name does not resolve, the VPN is down"
+        fail(
+            Kind::Network,
+            format!(
+                "cannot connect to {host}. Run `doctor`: if the name does not resolve, the VPN is down"
+            ),
         )
     } else {
-        anyhow::anyhow!("Dokploy request failed: {error}")
+        fail(Kind::Network, format!("Dokploy request failed: {error}"))
     }
 }
 

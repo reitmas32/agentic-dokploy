@@ -159,12 +159,61 @@ dokploy-agent apply --plan PLAN_ID --approve APPROVAL_TOKEN
 | `plan postgres-create …` | `postgres.create`; the password is read from an env var at apply time only |
 | `plan raw-post <procedure> --body-file body.json` | Only for procedures in `security.raw_post_allowlist` |
 
+A pending plan can be shown again, e.g. after a conversation was compacted:
+
+```sh
+dokploy-agent plan list            # pending and expired plans, with their target
+dokploy-agent plan show PLAN_ID    # summary, target and approval token of one plan
+```
+
 ### Edit an existing Compose safely
 
 ```sh
 dokploy-agent get compose --service production/docs --write-to /abs/private/docs.yaml
 # edit the owner-only file, then:
 dokploy-agent plan compose-update --service production/docs --file /abs/private/docs.yaml
+```
+
+## Errors and exit codes
+
+A failed command prints JSON on stdout and exits with the code of its kind, so a
+harness branches on `error.kind` instead of parsing messages:
+
+```json
+{"ok": false, "error": {"kind": "service_ambiguous", "exit_code": 5,
+  "message": "\"api\" matches 2 services; …",
+  "details": {"candidates": ["shop/production/api", "shop/staging/api"]}}}
+```
+
+| kind | exit | Meaning |
+| --- | --- | --- |
+| `error` | 1 | Anything else |
+| `config` | 2 | Invalid configuration or instance file, missing key |
+| `target_unmapped`, `target_ambiguous`, `target_unknown` | 3 | No instance, several instances, or an unknown one for this directory/flags (`details` lists them) |
+| `service_not_found` | 4 | No service matches the query |
+| `service_ambiguous` | 5 | Several services match (`details.candidates`) |
+| `network` | 10 | DNS, connection or timeout (usually the VPN) |
+| `auth` | 11 | The API key was rejected |
+| `api` | 12 | Another Dokploy error status |
+| `refused` | 20 | Refused by policy: destructive, not allowlisted, unsupported |
+| `terminal_approval_required` | 21 | The instance needs a person at a terminal to apply |
+| `approval_mismatch` | 22 | The token is not this plan's |
+| `plan_unavailable` | 23 | Unknown, expired or already applied plan |
+| `drift` | 24 | The remote changed since the plan was made |
+
+`doctor` prints its checks and exits 0, 10 (network) or 2 (configuration/key).
+
+## Skill for AI harnesses
+
+[`skills/dokploy-agent/SKILL.md`](skills/dokploy-agent/SKILL.md) teaches an agent
+the safe workflow: locate the Dokploy with `context`, read before proposing,
+present each plan with its target and wait for an explicit yes, apply exactly
+that plan, verify, and act on each error kind.
+
+```sh
+cargo install --path .                                         # puts dokploy-agent on the PATH
+ln -s "$PWD/skills/dokploy-agent" ~/.claude/skills/dokploy-agent   # Claude Code
+ln -s "$PWD/skills/dokploy-agent" ~/.codex/skills/dokploy-agent    # Codex
 ```
 
 ## From fdokploy

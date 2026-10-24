@@ -3,6 +3,7 @@ pub mod audit;
 pub mod client;
 pub mod config;
 pub mod envfile;
+pub mod failure;
 pub mod inventory;
 pub mod net;
 pub mod plan;

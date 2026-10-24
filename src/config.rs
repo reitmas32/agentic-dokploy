@@ -1,3 +1,4 @@
+use crate::failure::{Kind, fail, fail_with};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::{
@@ -332,12 +333,20 @@ impl Config {
                 return selection(self.instance(organization, name)?, SelectedBy::Flags);
             }
             (None, None) => {}
-            _ => bail!("pass both --org and --instance, or neither"),
+            _ => {
+                return Err(fail(
+                    Kind::Config,
+                    "pass both --org and --instance, or neither",
+                ));
+            }
         }
         if let Some(target) = env_target.filter(|t| !t.trim().is_empty()) {
-            let (organization, name) = target
-                .split_once('/')
-                .context("DOKPLOY_AGENT_TARGET must be organization/instance")?;
+            let (organization, name) = target.split_once('/').ok_or_else(|| {
+                fail(
+                    Kind::Config,
+                    "DOKPLOY_AGENT_TARGET must be organization/instance",
+                )
+            })?;
             return selection(self.instance(organization, name)?, SelectedBy::Environment);
         }
         if let Some(cwd) = cwd {
@@ -361,14 +370,18 @@ impl Config {
                     return selection(instance, SelectedBy::Path((*path).clone()));
                 }
                 [] => {}
-                many => bail!(
-                    "{} is inside paths of several instances ({}); pass --org and --instance",
-                    cwd.display(),
-                    many.iter()
-                        .map(|(i, _, _)| i.label())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
+                many => {
+                    let labels: Vec<String> = many.iter().map(|(i, _, _)| i.label()).collect();
+                    return Err(fail_with(
+                        Kind::TargetAmbiguous,
+                        format!(
+                            "{} is inside paths of several instances ({}); pass --org and --instance",
+                            cwd.display(),
+                            labels.join(", ")
+                        ),
+                        serde_json::json!({"directory": cwd, "candidates": labels}),
+                    ));
+                }
             }
         }
         if let Some(default) = self.instances.iter().find(|i| i.default) {
@@ -379,9 +392,14 @@ impl Config {
         let mapped = self.instances.iter().any(|i| !i.paths.is_empty());
         match self.instances.as_slice() {
             [only] if !mapped => selection(only, SelectedBy::OnlyInstance),
-            _ => bail!(
-                "no instance matches this directory: pass --org and --instance, set DOKPLOY_AGENT_TARGET, add the directory to an instance's paths, or mark one default = true"
-            ),
+            _ => Err(fail_with(
+                Kind::TargetUnmapped,
+                "no instance matches this directory: pass --org and --instance, set DOKPLOY_AGENT_TARGET, add the directory to an instance's paths, or mark one default = true",
+                serde_json::json!({
+                    "directory": cwd,
+                    "instances": self.instances.iter().map(|i| serde_json::json!({"target": i.label(), "paths": i.paths})).collect::<Vec<_>>()
+                }),
+            )),
         }
     }
 
@@ -399,9 +417,11 @@ impl Config {
         self.instances
             .iter()
             .find(|item| item.organization == organization && item.name == name)
-            .with_context(|| {
-                format!(
-                    "no instance configured for organization={organization:?}, instance={name:?}"
+            .ok_or_else(|| {
+                fail_with(
+                    Kind::TargetUnknown,
+                    format!("no instance configured for {organization}/{name}"),
+                    serde_json::json!({"instances": self.instances.iter().map(InstanceConfig::label).collect::<Vec<_>>()}),
                 )
             })
     }

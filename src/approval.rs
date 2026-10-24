@@ -5,8 +5,9 @@
 //! person at a real terminal can take: retyping the plan's short id. A harness
 //! runs without a TTY, so it cannot complete it.
 
+use crate::failure::{Kind, fail};
 use crate::plan::Plan;
-use anyhow::{Result, bail};
+use anyhow::Result;
 use std::io::{BufRead, IsTerminal, Write};
 
 /// The first 8 characters of the plan id: what the operator retypes.
@@ -17,9 +18,10 @@ pub fn short_id(plan: &Plan) -> String {
 /// Shows the plan on stderr and waits for the operator to retype its short id.
 pub fn confirm_in_terminal(plan: &Plan) -> Result<()> {
     if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
-        bail!(
-            "this instance requires terminal approval: a person must run `apply` from an interactive terminal (no TTY here)"
-        );
+        return Err(fail(
+            Kind::TerminalApprovalRequired,
+            "this instance requires terminal approval: a person must run `apply` from an interactive terminal (no TTY here)",
+        ));
     }
     let mut stderr = std::io::stderr();
     writeln!(
@@ -38,7 +40,10 @@ pub fn confirm_in_terminal(plan: &Plan) -> Result<()> {
     let mut answer = String::new();
     std::io::stdin().lock().read_line(&mut answer)?;
     if !answer_matches(&answer, &short_id(plan)) {
-        bail!("approval not confirmed; nothing was changed");
+        return Err(fail(
+            Kind::ApprovalMismatch,
+            "approval not confirmed; nothing was changed",
+        ));
     }
     Ok(())
 }

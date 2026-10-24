@@ -7,6 +7,7 @@
 //! and an ambiguous one fails listing the candidates instead of guessing.
 
 use crate::client::{DokployClient, ServiceKind};
+use crate::failure::{Kind, fail, fail_with};
 use anyhow::{Result, bail};
 use serde::Serialize;
 use serde_json::Value;
@@ -238,15 +239,18 @@ pub fn resolve<'a>(services: &'a [Service], query: &str) -> Result<&'a Service> 
     };
     match hits.as_slice() {
         [only] => Ok(only),
-        [] => bail!("no service matches {query:?}; list them with `get services`"),
-        many => bail!(
-            "{query:?} matches {} services; repeat with project/environment/service:\n{}",
-            many.len(),
-            many.iter()
-                .map(|s| format!("  {}", s.label()))
-                .collect::<Vec<_>>()
-                .join("\n")
-        ),
+        [] => Err(fail(
+            Kind::ServiceNotFound,
+            format!("no service matches {query:?}; list them with `get services`"),
+        )),
+        many => Err(fail_with(
+            Kind::ServiceAmbiguous,
+            format!(
+                "{query:?} matches {} services; repeat with project/environment/service",
+                many.len()
+            ),
+            serde_json::json!({"candidates": many.iter().map(|s| s.label()).collect::<Vec<_>>()}),
+        )),
     }
 }
 
@@ -305,9 +309,18 @@ mod tests {
     #[test]
     fn resolve_requires_disambiguation() {
         let services = flatten(&fixture());
-        let error = resolve(&services, "docs").unwrap_err().to_string();
-        assert!(
-            error.contains("landing/production/docs") && error.contains("landing/development/docs")
+        let error = resolve(&services, "docs").unwrap_err();
+        let (report, code) = crate::failure::report(&error);
+        assert_eq!(code, 5);
+        assert_eq!(report["error"]["kind"], "service_ambiguous");
+        assert_eq!(
+            report["error"]["details"]["candidates"],
+            serde_json::json!(["landing/production/docs", "landing/development/docs"])
+        );
+        let (report, code) = crate::failure::report(&resolve(&services, "nothing").unwrap_err());
+        assert_eq!(
+            (report["error"]["kind"].as_str(), code),
+            (Some("service_not_found"), 4)
         );
         assert_eq!(resolve(&services, "production/docs").unwrap().id, "c1");
         assert_eq!(

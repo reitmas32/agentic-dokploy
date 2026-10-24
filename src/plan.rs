@@ -1,3 +1,4 @@
+use crate::failure::{Kind, fail};
 use crate::{
     audit,
     client::{ServiceAction, ServiceKind, WriteEndpoint},
@@ -225,7 +226,10 @@ impl Plan {
             bail!("unsupported plan version");
         }
         if self.expires_at <= Utc::now() {
-            bail!("plan has expired; generate and review a new plan");
+            return Err(fail(
+                Kind::PlanUnavailable,
+                "plan has expired; generate and review a new plan",
+            ));
         }
         let expected = digest_fields(
             self.version,
@@ -307,7 +311,12 @@ pub fn save(root: &Path, plan: &Plan) -> Result<PathBuf> {
 pub fn load(root: &Path, id: &str) -> Result<Plan> {
     let id = Uuid::parse_str(id).context("plan must be a UUID")?;
     let path = root.join("plans").join(format!("{id}.json"));
-    let metadata = fs::symlink_metadata(&path).context("plan not found")?;
+    let metadata = fs::symlink_metadata(&path).map_err(|_| {
+        fail(
+            Kind::PlanUnavailable,
+            format!("plan {id} not found: it was never created here, or it was already applied"),
+        )
+    })?;
     if metadata.file_type().is_symlink() {
         bail!("refusing to load symbolic-link plan");
     }
@@ -332,8 +341,12 @@ pub fn claim(root: &Path, id: &str) -> Result<Plan> {
     let destination_dir = root.join("inflight");
     fs::create_dir_all(&destination_dir)?;
     let destination = destination_dir.join(format!("{id}.json"));
-    fs::rename(&source, &destination)
-        .context("plan is unavailable, already claimed, or not found")?;
+    fs::rename(&source, &destination).map_err(|_| {
+        fail(
+            Kind::PlanUnavailable,
+            "plan is unavailable, already claimed, or not found",
+        )
+    })?;
     let metadata = fs::symlink_metadata(&destination)?;
     if metadata.file_type().is_symlink() {
         bail!("refusing symbolic-link plan");

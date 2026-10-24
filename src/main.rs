@@ -8,6 +8,7 @@ use dokploy_agent::{
         validate_procedure,
     },
     config::{ApprovalMode, Config, InstanceConfig, Selection},
+    failure::{self, Kind, fail},
     inventory::{self, Service},
     net,
     plan::{self, Plan, PlannedAction},
@@ -22,6 +23,13 @@ use std::{
     process::Command,
 };
 use tokio::task::JoinSet;
+
+/// `bail!` with a failure kind the harness can branch on (see `failure`).
+macro_rules! refuse {
+    ($kind:expr, $($arg:tt)+) => {
+        return Err(dokploy_agent::failure::fail($kind, format!($($arg)+)))
+    };
+}
 
 #[derive(Parser)]
 #[command(
@@ -213,6 +221,12 @@ enum GetCommand {
 
 #[derive(Subcommand)]
 enum PlanCommand {
+    /// Plans waiting to be applied, with their target and expiry.
+    List,
+    /// One pending plan again: its summary, target and approval token.
+    Show {
+        plan: String,
+    },
     ComposeUpdate(ComposeUpdateArgs),
     PostgresCreate(PostgresCreateArgs),
     /// Deploy a service.
@@ -362,9 +376,27 @@ struct BackupComposeArgs {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+    // Every failure ends as JSON on stdout with a stable kind and exit code,
+    // so a harness branches on `error.kind` instead of parsing prose.
+    if let Err(error) = run().await {
+        let (report, code) = failure::report(&error);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).unwrap_or_default()
+        );
+        std::process::exit(code);
+    }
+}
+
+async fn run() -> Result<()> {
     let cli = Cli::parse();
-    let config = Config::load(&config_path(cli.config)?)?;
+    let config = Config::load(&config_path(cli.config)?).map_err(|error| match error
+        .downcast_ref::<failure::Failure>(
+    ) {
+        Some(_) => error,
+        None => fail(Kind::Config, format!("{error:#}")),
+    })?;
     let state = state_dir(cli.state_dir)?;
     match cli.command {
         CommandGroup::Config { command: ConfigCommand::Check } => print_json(&json!({"ok": true, "instances": config.instances.len(), "message": "Configuration is structurally valid. Credentials were not read."})),
@@ -376,6 +408,7 @@ async fn main() -> Result<()> {
         CommandGroup::Context(target) => {
             let selection = target.selection(&config)?;
             print_json(&json!({
+                "ok": true,
                 "target": selection.instance.label(), "base_url": selection.instance.base_url,
                 "selected_by": selection.selected_by,
                 "working_directory": std::env::current_dir().ok(),
@@ -385,6 +418,8 @@ async fn main() -> Result<()> {
         CommandGroup::Doctor(target) => doctor(&config, &target).await,
         CommandGroup::Get { command } => get(&config, command).await,
         CommandGroup::Api { target, filter } => api(&config, &target, filter.as_deref()).await,
+        CommandGroup::Plan { command: PlanCommand::List } => list_plans(&config, &state),
+        CommandGroup::Plan { command: PlanCommand::Show { plan } } => show_plan(&config, &state, &plan),
         CommandGroup::Plan { command } => create_plan(&config, &state, command).await,
         CommandGroup::Apply(args) => apply(&config, &state, args).await,
         CommandGroup::Backup { command: BackupCommand::Compose(args) } => backup_compose(&config, args).await,
@@ -448,7 +483,7 @@ async fn doctor(config: &Config, target: &Target) -> Result<()> {
         Err(_) => {
             checks.push(json!({"check": "dns", "ok": false, "host": host,
                 "hint": "the name does not resolve; for a .internal panel, connect to the VPN"}));
-            return finish_doctor(instance, checks, false);
+            return finish_doctor(instance, checks, Some(Kind::Network));
         }
     }
 
@@ -462,12 +497,12 @@ async fn doctor(config: &Config, target: &Target) -> Result<()> {
         Err(_) => {
             checks.push(json!({"check": "panel", "ok": false,
                 "hint": "the name resolves but nothing answers: is the VPN routing to it, is the panel up?"}));
-            return finish_doctor(instance, checks, false);
+            return finish_doctor(instance, checks, Some(Kind::Network));
         }
     }
 
     if !key_present {
-        return finish_doctor(instance, checks, false);
+        return finish_doctor(instance, checks, Some(Kind::Config));
     }
     let client = DokployClient::new(instance)?;
     if let Ok(version) = client
@@ -483,19 +518,31 @@ async fn doctor(config: &Config, target: &Target) -> Result<()> {
             checks.push(json!({"check": "api", "ok": true, "projects": projects.len(), "services": services.len()}));
         }
         Err(error) => {
-            checks.push(json!({"check": "api", "ok": false, "error": error.to_string()}));
-            ok = false;
+            let (report, _) = failure::report(&error);
+            checks.push(json!({"check": "api", "ok": false, "error": report["error"]}));
+            let kind = error
+                .chain()
+                .find_map(|e| e.downcast_ref::<failure::Failure>())
+                .map_or(Kind::Error, |f| f.kind);
+            return finish_doctor(instance, checks, Some(kind));
         }
     }
-    finish_doctor(instance, checks, ok)
+    finish_doctor(instance, checks, (!ok).then_some(Kind::Error))
 }
 
-fn finish_doctor(instance: &InstanceConfig, checks: Vec<Value>, ok: bool) -> Result<()> {
-    print_json(
-        &json!({"organization": instance.organization, "instance": instance.name, "ok": ok, "checks": checks}),
-    )?;
-    if !ok {
-        std::process::exit(1);
+/// Prints the checks; a failing doctor exits with the code of its first
+/// failure kind (10 network, 2 config) so a harness can tell VPN from key.
+fn finish_doctor(
+    instance: &InstanceConfig,
+    checks: Vec<Value>,
+    failed: Option<Kind>,
+) -> Result<()> {
+    print_json(&json!({
+        "organization": instance.organization, "instance": instance.name,
+        "ok": failed.is_none(), "failure": failed, "checks": checks
+    }))?;
+    if let Some(kind) = failed {
+        std::process::exit(kind.exit_code());
     }
     Ok(())
 }
@@ -589,7 +636,8 @@ async fn get(config: &Config, command: GetCommand) -> Result<()> {
             let client = DokployClient::new(instance)?;
             let (service, detail) = resolve_detail(&client, &query).await?;
             if !service.kind.has_environment() {
-                bail!(
+                refuse!(
+                    Kind::Refused,
                     "{} is a {}: Dokploy keeps no env block for it",
                     service.label(),
                     service.kind.label()
@@ -669,7 +717,8 @@ async fn get(config: &Config, command: GetCommand) -> Result<()> {
             let services = inventory::load(&client).await?;
             let service = inventory::resolve(&services, &query)?.clone();
             let Some(procedure) = service.kind.deployments_procedure() else {
-                bail!(
+                refuse!(
+                    Kind::Refused,
                     "{} is a {}: Dokploy keeps no deployment history for it; see `get service`",
                     service.label(),
                     service.kind.label()
@@ -754,7 +803,8 @@ async fn resolve_detail(client: &DokployClient, query: &str) -> Result<(Service,
 async fn compose_by_name(client: &DokployClient, query: &str) -> Result<Service> {
     let service = resolve_service(client, query).await?;
     if service.kind != dokploy_agent::client::ServiceKind::Compose {
-        bail!(
+        refuse!(
+            Kind::Refused,
             "{} is a {}, not a Compose",
             service.label(),
             service.kind.label()
@@ -955,6 +1005,7 @@ async fn create_plan(config: &Config, state: &Path, command: PlanCommand) -> Res
                 },
             )
         }
+        PlanCommand::List | PlanCommand::Show { .. } => unreachable!("dispatched in run"),
         PlanCommand::Deploy(args) => service_action(config, args, ServiceAction::Deploy).await?,
         PlanCommand::Redeploy(args) => {
             service_action(config, args, ServiceAction::Redeploy).await?
@@ -966,7 +1017,8 @@ async fn create_plan(config: &Config, state: &Path, command: PlanCommand) -> Res
             let client = DokployClient::new(instance)?;
             let (service, detail) = resolve_detail(&client, &args.service).await?;
             if !service.kind.has_environment() {
-                bail!(
+                refuse!(
+                    Kind::Refused,
                     "{} is a {}: Dokploy keeps no env block for it",
                     service.label(),
                     service.kind.label()
@@ -979,7 +1031,8 @@ async fn create_plan(config: &Config, state: &Path, command: PlanCommand) -> Res
                 .map(|line| line.key)
                 .collect::<Vec<_>>();
             if keys.is_empty() {
-                bail!(
+                refuse!(
+                    Kind::Refused,
                     "{} has no KEY=value lines; refusing to wipe every variable",
                     args.file.display()
                 );
@@ -1046,13 +1099,15 @@ async fn create_plan(config: &Config, state: &Path, command: PlanCommand) -> Res
             let instance = args.target.resolve(config)?;
             validate_procedure(&args.procedure)?;
             if is_destructive(&args.procedure) {
-                bail!(
+                refuse!(
+                    Kind::Refused,
                     "{} is destructive: deletes are run by a person from the Dokploy panel",
                     args.procedure
                 );
             }
             if !config.security.raw_post_allowlist.contains(&args.procedure) {
-                bail!(
+                refuse!(
+                    Kind::Refused,
                     "{} is not in security.raw_post_allowlist; add it there after reviewing its schema, or use a typed plan",
                     args.procedure
                 );
@@ -1096,8 +1151,83 @@ async fn create_plan(config: &Config, state: &Path, command: PlanCommand) -> Res
     print_json(&output)
 }
 
+/// A pending plan as a harness needs it after losing its conversation:
+/// what it does, where, until when, and the token to apply it.
+fn plan_view(config: &Config, plan: &Plan) -> Value {
+    let mut view = plan.safe_output();
+    let expired = plan.expires_at <= chrono::Utc::now();
+    view["status"] = json!(if expired { "expired" } else { "pending" });
+    view["created_at"] = json!(plan.created_at);
+    if let Ok(instance) = config.instance(&plan.organization, &plan.instance) {
+        view["target"] = json!({"instance": instance.label(), "base_url": instance.base_url});
+        if instance.approval(&config.security) == ApprovalMode::Terminal {
+            view["approval"] = json!(format!(
+                "terminal: a person must apply it from an interactive terminal and retype {}",
+                approval::short_id(plan)
+            ));
+        }
+    }
+    if expired {
+        view["next_step"] = json!("expired: create and review a new plan");
+    }
+    view
+}
+
+fn pending_plans(state: &Path) -> Result<Vec<Plan>> {
+    let directory = state.join("plans");
+    if !directory.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut plans = Vec::new();
+    for entry in fs::read_dir(&directory)? {
+        let path = entry?.path();
+        let Some(id) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".json"))
+            .filter(|n| !n.starts_with('.'))
+        else {
+            continue;
+        };
+        plans.push(plan::load(state, id)?);
+    }
+    plans.sort_by_key(|p| p.created_at);
+    Ok(plans)
+}
+
+fn list_plans(config: &Config, state: &Path) -> Result<()> {
+    let plans: Vec<Value> = pending_plans(state)?
+        .iter()
+        .map(|plan| {
+            let view = plan_view(config, plan);
+            json!({
+                "plan_id": plan.id, "status": view["status"], "operation": view["operation"],
+                "target": view.get("target"), "changes": view["changes"],
+                "created_at": plan.created_at, "expires_at": plan.expires_at
+            })
+        })
+        .collect();
+    print_json(&json!({"plans": plans}))
+}
+
+fn show_plan(config: &Config, state: &Path, id: &str) -> Result<()> {
+    let plan = plan::load(state, id)?;
+    plan.verify().or_else(|error| {
+        // An expired plan is still shown, marked as such; a tampered one is not.
+        if plan.expires_at <= chrono::Utc::now() {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    })?;
+    print_json(&plan_view(config, &plan))
+}
+
 fn plan_target(command: &PlanCommand) -> &Target {
     match command {
+        PlanCommand::List | PlanCommand::Show { .. } => {
+            unreachable!("plan list/show are dispatched before create_plan")
+        }
         PlanCommand::ComposeUpdate(a) => &a.target,
         PlanCommand::PostgresCreate(a) => &a.target,
         PlanCommand::Deploy(a)
@@ -1120,7 +1250,8 @@ async fn service_action(
     let client = DokployClient::new(instance)?;
     let service = resolve_service(&client, &args.service).await?;
     if !service.kind.supports(action) {
-        bail!(
+        refuse!(
+            Kind::Refused,
             "{} is a {}: Dokploy has no {} for it",
             service.label(),
             service.kind.label(),
@@ -1168,10 +1299,14 @@ async fn resolve_environment(client: &DokployClient, query: &str) -> Result<Stri
     }
     match matches.as_slice() {
         [only] => Ok(only.clone()),
-        [] => bail!(
+        [] => refuse!(
+            Kind::ServiceNotFound,
             "no environment matches {query:?}; use an id or project/environment (see `get projects`)"
         ),
-        _ => bail!("{query:?} matches several environments; use the environment id"),
+        _ => refuse!(
+            Kind::ServiceAmbiguous,
+            "{query:?} matches several environments; use the environment id"
+        ),
     }
 }
 
@@ -1192,8 +1327,14 @@ async fn resolve_server(client: &DokployClient, query: &str) -> Result<String> {
         .collect();
     match matches.as_slice() {
         [only] => Ok(only.clone()),
-        [] => bail!("no server matches {query:?}; see `get servers`"),
-        _ => bail!("{query:?} matches several servers; use the server id"),
+        [] => refuse!(
+            Kind::ServiceNotFound,
+            "no server matches {query:?}; see `get servers`"
+        ),
+        _ => refuse!(
+            Kind::ServiceAmbiguous,
+            "{query:?} matches several servers; use the server id"
+        ),
     }
 }
 
@@ -1205,7 +1346,10 @@ async fn apply(config: &Config, state: &Path, args: ApplyArgs) -> Result<()> {
     let reviewed = plan::load(state, &args.plan)?;
     reviewed.verify()?;
     if args.approve != reviewed.digest {
-        bail!("approval token does not match the reviewed plan");
+        refuse!(
+            Kind::ApprovalMismatch,
+            "approval token does not match the reviewed plan"
+        );
     }
     let instance = config.instance(&reviewed.organization, &reviewed.instance)?;
     if instance.approval(&config.security) == ApprovalMode::Terminal {
@@ -1213,7 +1357,10 @@ async fn apply(config: &Config, state: &Path, args: ApplyArgs) -> Result<()> {
     }
     let plan = plan::claim(state, &args.plan)?;
     if plan.digest != reviewed.digest {
-        bail!("plan changed between review and claim");
+        refuse!(
+            Kind::PlanUnavailable,
+            "plan changed between review and claim"
+        );
     }
     let client = DokployClient::new(instance)?;
     match execute(&client, state, &plan).await {
@@ -1248,7 +1395,8 @@ async fn execute(client: &DokployClient, state: &Path, plan: &Plan) -> Result<Va
                 .and_then(Value::as_str)
                 .context("Dokploy response contains no composeFile")?;
             if plan::content_sha256(remote_compose) != *base_remote_sha256 {
-                bail!(
+                refuse!(
+                    Kind::Drift,
                     "remote Compose changed since this plan was created; download, review, and create a new plan"
                 );
             }
@@ -1271,7 +1419,10 @@ async fn execute(client: &DokployClient, state: &Path, plan: &Plan) -> Result<Va
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             if plan::content_sha256(current) != *base_env_sha256 {
-                bail!("the env of {label} changed since this plan was created; create a new plan");
+                refuse!(
+                    Kind::Drift,
+                    "the env of {label} changed since this plan was created; create a new plan"
+                );
             }
             let backup = backup_env(state, label, current)?;
             extra.insert("previous_env_backup".into(), json!(backup));
