@@ -1,0 +1,47 @@
+# This file intentionally contains no secrets. Export the named environment
+# variables in the harness/CI environment before calling the CLI.
+
+[security]
+# HTTP is rejected by default. With allow_http = true it is accepted only
+# towards private hosts (.internal, .local, localhost, 10/8, 172.16/12,
+# 192.168/16, 100.64/10, fc00::/7): the API key travels in a header.
+allow_http = false
+plan_ttl_seconds = 900
+# Default approval for instances that do not set their own:
+#   token     apply with the plan's approval token (a harness can run it
+#             after the operator approves the plan in conversation)
+#   terminal  apply also needs an interactive terminal where a person
+#             retypes the plan's short id; a harness cannot complete it
+approval = "token"
+# Procedures `plan raw-post` may call, after reviewing their request schema.
+# Destructive procedures (delete, remove, destroy, ...) are always refused.
+raw_post_allowlist = []
+
+# One entry per Dokploy. Copy this file to ~/.config/dokploy-agent/config.toml.
+[[instances]]
+organization = "acme"
+name = "production"
+base_url = "https://dokploy.acme.example"
+# The API key: an owner-only file (chmod 600) or an environment variable
+# (api_key_env = "DOKPLOY_ACME_PRODUCTION_API_KEY"). Exactly one of the two.
+api_key_file = "/absolute/path/.config/dokploy-agent/keys/acme"
+# Commands run inside these directories target this instance.
+paths = ["/absolute/path/work/acme"]
+# Optional: stricter approval for this instance.
+approval = "terminal"
+# Optional: the instance used when nothing else selects one.
+# default = true
+
+[[instances]]
+organization = "other-org"
+name = "production"
+base_url = "https://dokploy.other.example"
+api_key_file = "/absolute/path/.config/dokploy-agent/keys/other-org"
+paths = ["/absolute/path/work/other-org"]
+
+# An optional local checkout used for immutable Compose snapshots. It must
+# already be a Git repository. No remote push is performed automatically.
+[compose_backup]
+repository_path = "/absolute/path/to/dokploy-configs"
+repository_url = "git@github.com:example/dokploy-configs.git"
+branch = "main"

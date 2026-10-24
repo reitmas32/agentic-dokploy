@@ -1,0 +1,8 @@
+/target/
+.env
+*.key
+*.pem
+config.toml
+plans/
+audit.jsonl
+/private-compose/
