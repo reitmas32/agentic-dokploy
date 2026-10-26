@@ -16,6 +16,8 @@ approval = "token"
 # Procedures `plan raw-post` may call, after reviewing their request schema.
 # Destructive procedures (delete, remove, destroy, ...) are always refused.
 raw_post_allowlist = []
+# The most lines `get logs` and `get deploy-log` read with --tail (1-10000).
+log_tail_max = 2000
 
 # One entry per Dokploy. Copy this file to ~/.config/dokploy-agent/config.toml.
 [[instances]]

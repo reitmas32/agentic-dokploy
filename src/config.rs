@@ -35,6 +35,9 @@ pub struct SecurityConfig {
     /// mutation goes through a typed plan. Destructive names are never accepted.
     #[serde(default)]
     pub raw_post_allowlist: Vec<String>,
+    /// The most lines `get logs` and `get deploy-log` accept in `--tail`.
+    #[serde(default = "default_log_tail_max")]
+    pub log_tail_max: u32,
 }
 
 /// Who can turn a reviewed plan into a real change.
@@ -55,6 +58,10 @@ fn default_plan_ttl() -> u64 {
     900
 }
 
+fn default_log_tail_max() -> u32 {
+    2000
+}
+
 impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
@@ -62,6 +69,7 @@ impl Default for SecurityConfig {
             plan_ttl_seconds: default_plan_ttl(),
             approval: ApprovalMode::default(),
             raw_post_allowlist: Vec::new(),
+            log_tail_max: default_log_tail_max(),
         }
     }
 }
@@ -205,6 +213,12 @@ impl Config {
         }
         if !(60..=3600).contains(&self.security.plan_ttl_seconds) {
             bail!("security.plan_ttl_seconds must be between 60 and 3600");
+        }
+        if !(1..=crate::logs::DOKPLOY_TAIL_MAX).contains(&self.security.log_tail_max) {
+            bail!(
+                "security.log_tail_max must be between 1 and {}",
+                crate::logs::DOKPLOY_TAIL_MAX
+            );
         }
         for instance in &self.instances {
             if instance.organization.trim().is_empty() || instance.name.trim().is_empty() {
@@ -517,6 +531,27 @@ mod tests {
         )
         .unwrap();
         assert!(parsed.validate().is_err());
+    }
+    #[test]
+    fn log_tail_max_defaults_and_is_bounded() {
+        let config = |security: &str| {
+            toml::from_str::<Config>(&format!(
+                r#"
+                [security]
+                {security}
+                [[instances]]
+                organization = "a"
+                name = "prod"
+                base_url = "https://dokploy.example.com"
+                api_key_env = "DOKPLOY_KEY"
+            "#
+            ))
+            .unwrap()
+        };
+        assert_eq!(config("").security.log_tail_max, 2000);
+        assert!(config("log_tail_max = 10000").validate().is_ok());
+        assert!(config("log_tail_max = 0").validate().is_err());
+        assert!(config("log_tail_max = 10001").validate().is_err());
     }
     #[test]
     fn http_is_only_accepted_towards_private_hosts() {

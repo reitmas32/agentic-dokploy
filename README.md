@@ -8,7 +8,8 @@ change is a reviewed, expiring plan.
 It covers everything the `fdokploy` shell client does (inventory, service
 detail, env, Compose, domains, deployments, servers, containers, API discovery,
 raw reads, deploy/redeploy/start/stop, env replacement and Compose creation),
-plus plan/apply with drift detection, audit logging and Compose backups.
+plus redacted container and deployment logs, plan/apply with drift detection,
+audit logging and Compose backups.
 
 ## Security model
 
@@ -24,6 +25,10 @@ plus plan/apply with drift detection, audit logging and Compose backups.
   and credential-bearing Traefik labels are replaced with `[REDACTED]`. `get env`
   shows variable names and value lengths only. Real values can be saved to a
   new owner-only file with `--write-to`, never to stdout.
+- **Logs** are redacted line by line before they are printed (see
+  [Logs](#logs)). `get raw` refuses `*.readLogs`; any other procedure that
+  answers plain text (a Traefik file, a command) has no keys to redact by, so
+  `get raw` runs that text through the same credential patterns.
 - **Error bodies** from Dokploy are withheld (a server could echo request data);
   errors carry a hint instead (rejected key, unknown procedure, VPN down).
 - **Mutations** are two-step. `plan` validates the change, resolves names to ids
@@ -132,11 +137,57 @@ dokploy-agent get compose --service production/docs --show-compose # sanitized s
 dokploy-agent get compose --id cmp_123 --write-to /abs/cmp.yaml    # the real file, owner-only
 dokploy-agent get domains production/landing
 dokploy-agent get deployments production/docs --limit 5
+dokploy-agent get logs shop/production/api --container web --tail 100   # container logs, redacted
+dokploy-agent get deploy-log shop/production/api                        # build/deploy log, redacted
 dokploy-agent get servers
 dokploy-agent get containers [--server-id …]
 dokploy-agent get raw project.one --param projectId=…  # any read procedure, redacted
 dokploy-agent api [filter]                             # read procedures this panel answers + plannable mutations
 ```
+
+### Logs
+
+```sh
+dokploy-agent get logs <service> [--container <compose service|name|id>] [--tail 200] [--since all|30s|10m|1h|2d] [--search text]
+dokploy-agent get deploy-log <service> [--deployment <id>] [--tail 200] [--search text]
+```
+
+Both are reads: no plan, no approval. They print
+`{service, container, container_state, tail, since, search, lines: [{ts, line}]}`
+(`deploy-log` prints `deployment` instead of the container) with Docker's
+timestamp split off and color codes removed.
+
+- **Source**: `<router>.readLogs`, the last `--tail` lines of `docker logs
+  --timestamps` (or `docker service logs --raw` for native databases, which run
+  as Swarm services), and `deployment.readLogs` for the build log. Dokploy runs
+  them on the service's server; they need read access to the service.
+- **Containers**: an application or database has one. A Compose runs one per
+  service, named `<appName>-<service>-<n>`: pass `--container web` (or a
+  container name or id). Without it, a Compose with several containers fails
+  with `service_ambiguous` and `details.candidates` lists its services; among
+  several `web` containers the only running one wins.
+- **Limits**: `--tail` defaults to 200 and is capped by
+  `security.log_tail_max` (2000 by default, at most Dokploy's 10000).
+  `--since` takes Dokploy's format; days are sent to Docker as hours (`2d` →
+  `48h`), since `docker logs` has no day unit.
+- **Search** filters the fetched lines locally, ignoring case, after
+  redaction. It is never sent to Dokploy: a server-side match on raw logs would
+  reveal whether a secret starts with the searched text.
+- **Redaction** replaces with `[REDACTED]`, before printing:
+  - the literal value (6 characters or more) of every secret of the service:
+    env and build variables whose key looks secret (`password`, `secret`,
+    `token`, `api_key`, …, plus `*_KEY` and `*_DSN`), values written in the
+    Compose `environment`, URL passwords in any env value, and secret fields of
+    the service such as a database password or a private key;
+  - credentials in URLs (`scheme://user:[REDACTED]@`, or a long token used as
+    the user), `Authorization` values, `Bearer` tokens, JWTs and PEM blocks;
+  - well-known token formats (GitHub, GitLab, Slack, OpenAI/Anthropic `sk-`,
+    Stripe, AWS access keys) and `password=`, `secret:`, `token=`,
+    `api_key: "…"`, `Set-Cookie:` style pairs.
+
+  Redaction is a best effort over free text: a secret printed in a form it
+  does not recognise (encoded, split, shorter than 6 characters) can still
+  show. Keep `DEBUG` and settings dumps off where it matters.
 
 ## Changing
 
@@ -233,6 +284,7 @@ ln -s "$PWD/skills/dokploy-agent" ~/.codex/skills/dokploy-agent    # Codex
 | `servers` / `containers [server]` | `get servers` / `get containers [--server-id …]` |
 | `api [text]` | `api [text]` |
 | `get <procedure> k=v` | `get raw <procedure> --param k=v` |
+| (none) | `get logs <name> [--container web]` / `get deploy-log <name>` (redacted) |
 | `deploy` / `redeploy` / `stop` / `start <name> -y` | `plan deploy\|redeploy\|stop\|start <name>` + `apply` |
 | `env-set <name> <file> -y` | `plan env-set <name> --file <file>` + `apply` |
 | `post compose.create …` + `post compose.update {sourceType: raw}` | `plan compose-create …` + `apply` |

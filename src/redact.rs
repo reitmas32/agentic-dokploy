@@ -6,7 +6,7 @@ use serde_json::Value;
 pub const REDACTED: &str = "[REDACTED]";
 
 /// Keys whose value is a secret or may contain one.
-fn is_secret_key(key: &str) -> bool {
+pub fn is_secret_key(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
     matches!(
         key.as_str(),
@@ -107,20 +107,26 @@ pub struct EnvLine {
 
 /// The keys of a dotenv-style block, in order, without their values.
 pub fn env_keys(env: &str) -> Vec<EnvLine> {
-    env.lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                return None;
-            }
-            let line = line.strip_prefix("export ").unwrap_or(line);
-            let (key, value) = line.split_once('=')?;
-            Some(EnvLine {
-                key: key.trim().to_owned(),
-                length: value.chars().count(),
-            })
+    env_pairs(env)
+        .map(|(key, value)| EnvLine {
+            key: key.to_owned(),
+            length: value.chars().count(),
         })
         .collect()
+}
+
+/// The `KEY=value` lines of a dotenv-style block, in order. The value is
+/// returned as written, quotes included. Never print it.
+pub fn env_pairs(env: &str) -> impl Iterator<Item = (&str, &str)> {
+    env.lines().filter_map(|line| {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            return None;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let (key, value) = line.split_once('=')?;
+        Some((key.trim(), value))
+    })
 }
 
 #[cfg(test)]
