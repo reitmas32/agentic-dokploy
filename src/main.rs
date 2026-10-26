@@ -4,13 +4,13 @@ use directories::ProjectDirs;
 use dokploy_agent::{
     approval,
     client::{
-        DokployClient, ReadOperation, ServiceAction, http_client, is_destructive,
+        DokployClient, ReadOperation, ServiceAction, ServiceKind, http_client, is_destructive,
         validate_procedure,
     },
     config::{ApprovalMode, Config, InstanceConfig, Selection},
     failure::{self, Kind, fail},
     inventory::{self, Service},
-    net,
+    logs, net,
     plan::{self, Plan, PlannedAction},
     print_json,
     redact::{self, env_keys},
@@ -199,6 +199,42 @@ enum GetCommand {
         query: String,
         #[arg(long, default_value_t = 15)]
         limit: usize,
+    },
+    /// The last lines a service's containers printed, with secrets redacted.
+    Logs {
+        #[command(flatten)]
+        target: Target,
+        /// `name`, `environment/name` or `project/environment/name`.
+        query: String,
+        /// Compose service (`web`), container name or id. Needed when a Compose
+        /// runs several containers.
+        #[arg(long)]
+        container: Option<String>,
+        /// Lines to read, before --search (at most security.log_tail_max).
+        #[arg(long, default_value_t = 200)]
+        tail: u32,
+        /// `all` or a duration: 30s, 10m, 1h, 2d.
+        #[arg(long, default_value = "all")]
+        since: String,
+        /// Only lines containing this text, ignoring case. Matched here, after
+        /// redaction; Dokploy never receives it.
+        #[arg(long)]
+        search: Option<String>,
+    },
+    /// The build and deploy log of an application or Compose, with secrets redacted.
+    DeployLog {
+        #[command(flatten)]
+        target: Target,
+        query: String,
+        /// Deployment id (see `get deployments`); the latest when omitted.
+        #[arg(long)]
+        deployment: Option<String>,
+        /// Last lines to read, before --search (at most security.log_tail_max).
+        #[arg(long, default_value_t = 200)]
+        tail: u32,
+        /// Only lines containing this text, ignoring case, matched after redaction.
+        #[arg(long)]
+        search: Option<String>,
     },
     /// Docker containers the panel sees.
     Containers {
@@ -735,6 +771,137 @@ async fn get(config: &Config, command: GetCommand) -> Result<()> {
                 json!({"service": service.label(), "deployments": rows}),
             ))
         }
+        GetCommand::Logs {
+            target,
+            query,
+            container,
+            tail,
+            since,
+            search,
+        } => {
+            logs::validate_tail(tail, config.security.log_tail_max)?;
+            let docker_since = logs::docker_since(&since)?;
+            if let Some(search) = &search {
+                logs::validate_search(search)?;
+            }
+            let instance = target.resolve(config)?;
+            let client = DokployClient::new(instance)?;
+            let (service, detail) = resolve_detail(&client, &query).await?;
+            let mut params = vec![
+                (service.kind.id_param(), service.id.clone()),
+                ("tail", tail.to_string()),
+                ("since", docker_since),
+            ];
+            let (container_name, container_state) = if service.kind == ServiceKind::Compose {
+                let picked =
+                    compose_container(&client, &service, &detail, container.as_deref()).await?;
+                params.push(("containerId", picked.id));
+                (json!(picked.name), json!(picked.state))
+            } else {
+                if container.is_some() {
+                    refuse!(
+                        Kind::Refused,
+                        "--container only applies to a Compose; {} is a {} with a single container",
+                        service.label(),
+                        service.kind.label()
+                    );
+                }
+                (
+                    detail.get("appName").cloned().unwrap_or_default(),
+                    Value::Null,
+                )
+            };
+            let query: Vec<(&str, &str)> = params.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            let text = client
+                .get_procedure(&format!("{}.readLogs", service.kind.router()), &query)
+                .await?;
+            let lines = redacted_lines(&detail, &text, search.as_deref())?;
+            print_json(&envelope(
+                instance,
+                json!({
+                    "service": service.label(), "container": container_name,
+                    "container_state": container_state, "tail": tail, "since": since,
+                    "search": search, "lines": lines
+                }),
+            ))
+        }
+        GetCommand::DeployLog {
+            target,
+            query,
+            deployment,
+            tail,
+            search,
+        } => {
+            logs::validate_tail(tail, config.security.log_tail_max)?;
+            if let Some(search) = &search {
+                logs::validate_search(search)?;
+            }
+            let instance = target.resolve(config)?;
+            let client = DokployClient::new(instance)?;
+            let (service, detail) = resolve_detail(&client, &query).await?;
+            let Some(procedure) = service.kind.deployments_procedure() else {
+                refuse!(
+                    Kind::Refused,
+                    "{} is a {}: Dokploy keeps no deployment log for it; see `get logs`",
+                    service.label(),
+                    service.kind.label()
+                );
+            };
+            let deployments = client
+                .get_procedure(procedure, &[(service.kind.id_param(), service.id.as_str())])
+                .await?;
+            let mut deployments: Vec<&Value> =
+                deployments.as_array().into_iter().flatten().collect();
+            deployments.sort_by(|a, b| {
+                let created = |d: &Value| {
+                    d.get("createdAt")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                };
+                created(b).cmp(&created(a))
+            });
+            let id_of = |d: &Value| {
+                d.get("deploymentId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            };
+            let chosen = match deployment.as_deref() {
+                // Only a deployment of this service: its secrets are the ones redacted.
+                Some(id) => deployments.iter().find(|d| id_of(d).as_deref() == Some(id)),
+                None => deployments.first(),
+            };
+            let Some(chosen) = chosen else {
+                refuse!(
+                    Kind::ServiceNotFound,
+                    "{} has no deployment {}; see `get deployments`",
+                    service.label(),
+                    deployment.as_deref().unwrap_or("yet")
+                );
+            };
+            let deployment_id =
+                id_of(chosen).context("Dokploy listed a deployment without an id")?;
+            let text = client
+                .get_procedure(
+                    "deployment.readLogs",
+                    &[
+                        ("deploymentId", deployment_id.as_str()),
+                        ("tail", &tail.to_string()),
+                    ],
+                )
+                .await?;
+            let lines = redacted_lines(&detail, &text, search.as_deref())?;
+            print_json(&envelope(
+                instance,
+                json!({
+                    "service": service.label(),
+                    "deployment": {
+                        "deployment_id": deployment_id, "status": chosen.get("status"),
+                        "title": chosen.get("title"), "created_at": chosen.get("createdAt")
+                    },
+                    "tail": tail, "search": search, "lines": lines
+                }),
+            ))
+        }
         GetCommand::Containers { target, server_id } => {
             let instance = target.resolve(config)?;
             let query: Vec<(&str, &str)> = server_id
@@ -762,6 +929,13 @@ async fn get(config: &Config, command: GetCommand) -> Result<()> {
                         .with_context(|| format!("--param must be key=value, got {p:?}"))
                 })
                 .collect::<Result<Vec<_>>>()?;
+            let action = procedure.split_once('.').map_or("", |(_, action)| action);
+            if action.to_ascii_lowercase().contains("logs") {
+                refuse!(
+                    Kind::Refused,
+                    "{procedure} returns raw logs that `get raw` cannot redact; use `get logs` or `get deploy-log`"
+                );
+            }
             raw_read(config, &target, &procedure, &params).await
         }
     }
@@ -784,6 +958,55 @@ async fn raw_read<K: AsRef<str>, V: AsRef<str>>(
     print_json(&envelope(instance, redact::redact(result)))
 }
 
+/// The container of a Compose whose logs `get logs` reads.
+async fn compose_container(
+    client: &DokployClient,
+    service: &Service,
+    detail: &Value,
+    wanted: Option<&str>,
+) -> Result<logs::Container> {
+    let text = |key: &str, fallback: &'static str| {
+        detail.get(key).and_then(Value::as_str).unwrap_or(fallback)
+    };
+    let app_name = detail
+        .get("appName")
+        .and_then(Value::as_str)
+        .unwrap_or(&service.app_name);
+    let app_type = match text("composeType", "docker-compose") {
+        "stack" => "stack",
+        _ => "docker-compose",
+    };
+    let mut query = vec![("appName", app_name), ("appType", app_type)];
+    let server_id = text("serverId", "");
+    if !server_id.is_empty() {
+        query.push(("serverId", server_id));
+    }
+    let response = client
+        .get_procedure("docker.getContainersByAppNameMatch", &query)
+        .await?;
+    let containers = logs::containers(&response, app_name);
+    Ok(logs::pick_container(&containers, wanted, &service.label())?.clone())
+}
+
+/// A `readLogs` answer as redacted lines, filtered by `search` afterwards so
+/// the filter never sees a secret.
+fn redacted_lines(
+    detail: &Value,
+    response: &Value,
+    search: Option<&str>,
+) -> Result<Vec<logs::LogLine>> {
+    let text = match response {
+        Value::String(text) => text.as_str(),
+        Value::Null => "",
+        _ => bail!("Dokploy answered the logs with something other than text"),
+    };
+    Ok(logs::Redactor::for_service(detail)
+        .lines(text)
+        .into_iter()
+        .filter(|line| search.is_none_or(|search| line.contains(search)))
+        .collect())
+}
+
 async fn resolve_service(client: &DokployClient, query: &str) -> Result<Service> {
     let services = inventory::load(client).await?;
     Ok(inventory::resolve(&services, query)?.clone())
@@ -802,7 +1025,7 @@ async fn resolve_detail(client: &DokployClient, query: &str) -> Result<(Service,
 
 async fn compose_by_name(client: &DokployClient, query: &str) -> Result<Service> {
     let service = resolve_service(client, query).await?;
-    if service.kind != dokploy_agent::client::ServiceKind::Compose {
+    if service.kind != ServiceKind::Compose {
         refuse!(
             Kind::Refused,
             "{} is a {}, not a Compose",
@@ -909,6 +1132,15 @@ const API_READS: &[&str] = &[
     "gitProvider.getAll",
     "backup.one",
     "mounts.allNamedByApplicationId",
+    "application.readLogs",
+    "compose.readLogs",
+    "postgres.readLogs",
+    "mysql.readLogs",
+    "mariadb.readLogs",
+    "mongo.readLogs",
+    "redis.readLogs",
+    "libsql.readLogs",
+    "deployment.readLogs",
 ];
 
 async fn api(config: &Config, target: &Target, filter: Option<&str>) -> Result<()> {
@@ -940,12 +1172,18 @@ async fn api(config: &Config, target: &Target, filter: Option<&str>) -> Result<(
         {"plan": "postgres-create", "procedures": "postgres.create"},
         {"plan": "raw-post", "procedures": config.security.raw_post_allowlist},
     ]);
+    // Reads with their own command: the raw answer would carry secrets.
+    let logs = json!([
+        {"get": "logs", "procedures": "<router>.readLogs (+ docker.getContainersByAppNameMatch for a Compose)", "redacted": true},
+        {"get": "deploy-log", "procedures": "deployment.readLogs", "redacted": true},
+    ]);
     let keep =
         |v: &Value| filter.is_none_or(|f| v.to_string().to_lowercase().contains(&f.to_lowercase()));
     print_json(&envelope(
         instance,
         json!({
             "reads": reads.into_iter().filter(keep).collect::<Vec<_>>(),
+            "logs": logs.as_array().unwrap().iter().filter(|v| keep(v)).collect::<Vec<_>>(),
             "mutations": mutations.as_array().unwrap().iter().filter(|v| keep(v)).collect::<Vec<_>>(),
             "destructive": "never available: deletes are run by a person from the Dokploy panel"
         }),
@@ -1748,4 +1986,83 @@ fn safe_compose_view(content: &str) -> Value {
         );
     }
     json!({"services": output})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn get(args: &[&str]) -> GetCommand {
+        let cli = Cli::try_parse_from([&["dokploy-agent", "get"], args].concat()).unwrap();
+        match cli.command {
+            CommandGroup::Get { command } => command,
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn logs_arguments_have_bounded_defaults() {
+        let GetCommand::Logs {
+            query,
+            container,
+            tail,
+            since,
+            search,
+            ..
+        } = get(&["logs", "Platform/development/[API] Core"])
+        else {
+            panic!("not get logs");
+        };
+        assert_eq!(query, "Platform/development/[API] Core");
+        assert_eq!(
+            (container, tail, since.as_str(), search),
+            (None, 200, "all", None)
+        );
+
+        let GetCommand::Logs {
+            container,
+            tail,
+            since,
+            search,
+            ..
+        } = get(&[
+            "logs",
+            "core",
+            "--container",
+            "web",
+            "--tail",
+            "100",
+            "--since",
+            "10m",
+            "--search",
+            "connection already closed",
+        ])
+        else {
+            panic!("not get logs");
+        };
+        assert_eq!(container.as_deref(), Some("web"));
+        assert_eq!((tail, since.as_str()), (100, "10m"));
+        assert_eq!(search.as_deref(), Some("connection already closed"));
+    }
+
+    #[test]
+    fn deploy_log_takes_an_optional_deployment() {
+        let GetCommand::DeployLog {
+            deployment, tail, ..
+        } = get(&[
+            "deploy-log",
+            "core",
+            "--deployment",
+            "zOU80is0",
+            "--tail",
+            "50",
+        ])
+        else {
+            panic!("not get deploy-log");
+        };
+        assert_eq!((deployment.as_deref(), tail), (Some("zOU80is0"), 50));
+        assert!(
+            Cli::try_parse_from(["dokploy-agent", "get", "logs", "core", "--tail", "-1"]).is_err()
+        );
+    }
 }

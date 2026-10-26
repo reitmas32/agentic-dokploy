@@ -5,6 +5,7 @@ pub mod config;
 pub mod envfile;
 pub mod failure;
 pub mod inventory;
+pub mod logs;
 pub mod net;
 pub mod plan;
 pub mod redact;

@@ -2,13 +2,14 @@
 name: dokploy-agent
 description: >-
   Operate Dokploy through the dokploy-agent CLI: inspect services, composes,
-  env keys, domains and deployments, and change infrastructure (deploy,
-  redeploy, start, stop, replace env, create or update a Compose) through
-  reviewed plans that the user approves one by one. Use whenever the user asks
-  about or wants to change anything running on Dokploy — a deploy, a service
-  status, a Compose, env variables, a new service, "is X up", "why did the
-  deploy fail" — even if they don't name the tool. Never use the Dokploy web
-  UI, curl or another client for this.
+  env keys, domains, deployments and redacted container and deploy logs, and
+  change infrastructure (deploy, redeploy, start, stop, replace env, create or
+  update a Compose) through reviewed plans that the user approves one by one.
+  Use whenever the user asks about or wants to change anything running on
+  Dokploy — a deploy, a service status, a Compose, env variables, a new
+  service, "is X up", "why did the deploy fail", "show me the logs", "why is X
+  erroring" — even if they don't name the tool. Never use the Dokploy web UI,
+  curl or another client for this.
 ---
 
 # dokploy-agent
@@ -53,6 +54,9 @@ dokploy-agent get services [filter]            # what runs, where, with status
 dokploy-agent get service <svc>                 # server, source, image, env keys, domains
 dokploy-agent get compose --service <svc> --show-compose   # services, images, labels (redacted)
 dokploy-agent get deployments <svc> --limit 5   # last deploys and their status
+dokploy-agent get logs <svc> [--container web] [--tail 200] [--since 10m] [--search text]
+                                                # container logs, secrets redacted
+dokploy-agent get deploy-log <svc> [--deployment <id>]   # build/deploy log, redacted
 dokploy-agent get env <svc>                     # env KEYS and value lengths only
 dokploy-agent get domains <svc>
 dokploy-agent get servers
@@ -65,6 +69,22 @@ A service is `name`, `environment/name` or `project/environment/name`. The same
 name usually exists in several environments: on `service_ambiguous`, show
 `details.candidates` and ask which one, unless the conversation already makes
 it unambiguous (then use the full `project/environment/name`).
+
+Logs are reads like the others: no plan, no approval. When something is
+failing, read them before proposing a fix (a redeploy rarely cures a crash).
+
+- A Compose runs one container per service: pass `--container <service>`
+  (`web`, `worker`, …). Without it, `service_ambiguous` lists the services in
+  `details.candidates`; pick the one the conversation is about, or ask.
+- Start small (`--tail 200`, the default) and narrow with `--since 10m` or
+  `--search "Traceback"` instead of raising `--tail`. `--search` matches the
+  fetched lines, ignoring case, after redaction.
+- `lines[].ts` is Docker's timestamp; `container_state` tells a crashed
+  container (`exited`, `restarting`) from a running one.
+- A failed deployment (`get deployments` shows `error`): read
+  `get deploy-log <svc> --deployment <id>`.
+- Secrets in log lines show as `[REDACTED]`. Do not try to recover them: no
+  `get raw … readLogs` (refused), no `--search` guessing.
 
 ### 3. Propose the change and wait
 
@@ -116,6 +136,7 @@ After `apply`, check the result instead of assuming it:
 ```sh
 dokploy-agent get deployments <svc> --limit 3   # the new deployment and its status
 dokploy-agent get service <svc>                  # status done / running
+dokploy-agent get logs <svc> [--container web] --since 5m   # it started and serves
 ```
 
 and, for a web service, request its URL. Report what ran, what it returned
@@ -130,7 +151,7 @@ Failures are JSON on stdout: `{"ok": false, "error": {"kind", "exit_code",
 | --- | --- | --- |
 | `target_unmapped` / `target_ambiguous` / `target_unknown` | 3 | Step 1: show the instances or candidates and ask |
 | `service_not_found` | 4 | `get services [filter]` and propose the closest names |
-| `service_ambiguous` | 5 | Show `details.candidates`, ask which one |
+| `service_ambiguous` | 5 | Show `details.candidates`, ask which one (for `get logs` on a Compose: its services, pass one with `--container`) |
 | `network` | 10 | Run `doctor`. A private panel that does not resolve means the VPN is down: tell the user; do not retry in a loop |
 | `auth` | 11 | The API key was rejected: tell the user to renew it in their instance file. Never ask them to paste it in the chat |
 | `api` | 12 | Report it. A 404 means the procedure does not exist on this Dokploy version (`api` lists the real ones) |
@@ -154,7 +175,9 @@ instance configuration or key is missing.
 - **Secrets stay out of the conversation.** Never ask for or paste API keys.
   `get env` shows keys only; if real values are needed, `--write-to` a new
   owner-only file and do not print it. Do not `cat` instance files or plan
-  files.
+  files. Logs are redacted, but redaction is best effort: if a line still
+  shows something that looks like a credential, do not repeat it; tell the
+  user which service and line.
 - **No other channel.** If the CLI cannot do something, say so; do not fall
   back to the web UI, `curl` against the API, or SSH to the server.
 - **Report what happened, not what you expected.** A queued deploy is not a
