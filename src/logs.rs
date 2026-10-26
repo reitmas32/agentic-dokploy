@@ -312,6 +312,20 @@ impl Redactor {
             .collect()
     }
 
+    /// Free text (a config file, a log) redacted line by line and returned
+    /// whole: lines, timestamps and a final newline are kept.
+    pub fn text(&self, text: &str) -> String {
+        let mut pem_lines_left = 0;
+        let mut out: Vec<String> = text
+            .lines()
+            .map(|line| self.redact(&redact_pem(line, &mut pem_lines_left)))
+            .collect();
+        if text.ends_with('\n') {
+            out.push(String::new());
+        }
+        out.join("\n")
+    }
+
     /// One line of text with every secret replaced. PEM blocks need `lines`.
     pub fn redact(&self, text: &str) -> String {
         let mut text = text.to_owned();
@@ -763,6 +777,22 @@ mod tests {
             lines[0].ts.as_deref(),
             Some("2026-10-26T04:02:58.295905747Z")
         );
+    }
+
+    #[test]
+    fn text_is_redacted_and_keeps_its_shape() {
+        let text = "providers:\n  docker:\n    endpoint: tcp://admin:hunter22@docker:2375\n\
+                    acme:\n  email: ops@example.com\n\
+                    key: |\n  -----BEGIN EC PRIVATE KEY-----\n  MHcCAQEEIB\n  -----END EC PRIVATE KEY-----\n\
+                    2026-10-26T04:02:58Z token: abc123\n";
+        assert_eq!(
+            Redactor::default().text(text),
+            "providers:\n  docker:\n    endpoint: tcp://admin:[REDACTED]@docker:2375\n\
+             acme:\n  email: ops@example.com\n\
+             key: |\n  [REDACTED]\n[REDACTED]\n[REDACTED]\n\
+             2026-10-26T04:02:58Z token: [REDACTED]\n"
+        );
+        assert_eq!(Redactor::default().text("no newline"), "no newline");
     }
 
     #[test]

@@ -26,7 +26,9 @@ audit logging and Compose backups.
   shows variable names and value lengths only. Real values can be saved to a
   new owner-only file with `--write-to`, never to stdout.
 - **Logs** are redacted line by line before they are printed (see
-  [Logs](#logs)). `get raw` refuses `*.readLogs`, whose answer it could not redact.
+  [Logs](#logs)). `get raw` refuses `*.readLogs`; any other procedure that
+  answers plain text (a Traefik file, a command) has no keys to redact by, so
+  `get raw` runs that text through the same credential patterns.
 - **Error bodies** from Dokploy are withheld (a server could echo request data);
   errors carry a hint instead (rejected key, unknown procedure, VPN down).
 - **Mutations** are two-step. `plan` validates the change, resolves names to ids

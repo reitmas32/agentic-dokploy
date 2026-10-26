@@ -955,7 +955,18 @@ async fn raw_read<K: AsRef<str>, V: AsRef<str>>(
     let result = DokployClient::new(instance)?
         .get_procedure(procedure, &query)
         .await?;
-    print_json(&envelope(instance, redact::redact(result)))
+    print_json(&envelope(instance, redact_raw(result)))
+}
+
+/// A raw read as it may be printed. Key-based redaction cannot see into a
+/// procedure that answers text (a Traefik file, a command), so that text goes
+/// through the log redactor's patterns; there is no service to take literal
+/// secrets from.
+fn redact_raw(result: Value) -> Value {
+    match redact::redact(result) {
+        Value::String(text) => Value::String(logs::Redactor::default().text(&text)),
+        other => other,
+    }
 }
 
 /// The container of a Compose whose logs `get logs` reads.
@@ -2043,6 +2054,21 @@ mod tests {
         assert_eq!(container.as_deref(), Some("web"));
         assert_eq!((tail, since.as_str()), (100, "10m"));
         assert_eq!(search.as_deref(), Some("connection already closed"));
+    }
+
+    #[test]
+    fn raw_text_answers_are_redacted_too() {
+        assert_eq!(
+            redact_raw(json!(
+                "ok\nAuthorization: Bearer abcdefgh12345678\nurl: redis://:pw-1234@cache:6379\n"
+            )),
+            json!("ok\nAuthorization: [REDACTED]\nurl: redis://:[REDACTED]@cache:6379\n")
+        );
+        // JSON answers keep key-based redaction; their other strings are untouched.
+        assert_eq!(
+            redact_raw(json!({"name": "password=visible-by-key-rules", "env": "A=1"})),
+            json!({"name": "password=visible-by-key-rules", "env": "[REDACTED]"})
+        );
     }
 
     #[test]
